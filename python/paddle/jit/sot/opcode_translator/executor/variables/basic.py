@@ -18,7 +18,6 @@ import dataclasses
 import operator
 import sys
 import types
-from dataclasses import is_dataclass
 from enum import Enum
 from functools import cached_property, reduce
 from typing import TYPE_CHECKING, Any
@@ -28,6 +27,12 @@ import numpy as np
 import paddle
 from paddle._typing import unreached
 from paddle.framework import core
+from paddle.jit.dy2static.utils import (
+    dataclass_as_dict,
+    dataclass_from_dict,
+    is_plain_dataclass_type,
+    parameters_persistent_mode_is_enabled,
+)
 from paddle.jit.sot.opcode_translator.executor.pycode_generator import PyCodeGen
 from paddle.pir.core import _PADDLE_PIR_DTYPE_2_NUMPY_DTYPE
 
@@ -76,6 +81,7 @@ from ....symbolic_shape.symbolic_value import (
 )
 from ....utils import (
     ENV_SOT_ALLOW_DYNAMIC_SHAPE,
+    ENV_SOT_ENABLE_0_SIZE_FALLBACK,
     BreakGraphError,
     BuiltinFunctionBreak,
     ConditionalFallbackError,
@@ -452,7 +458,7 @@ class TensorVariable(VariableBase):
             and not self.meta.is_null()
         ):
             dynamic_axes = self.analyse_dynamic_axes(tracker)
-        self.var_name = TensorVariable.var_name_generator.next()
+        self.var_name = self.var_name_generator.next()
         self.graph.side_effects.record_mutable_variable(self)
         self.meta = self.meta.with_dynamic_axes(self.var_name, dynamic_axes)
         self.origin_meta = self.meta
@@ -1407,6 +1413,8 @@ class SymbolicVariable(VariableBase):
         if not ENV_SOT_ALLOW_DYNAMIC_SHAPE.get():
             return None
         if isinstance(value, SymbolicInt):
+            if value.is_backed():
+                return SymbolicVariable(value, graph, tracker)
             tensor_shape_source_result = (
                 SymbolicVariable.find_tensor_shape_source(tracker)
             )
@@ -1446,6 +1454,7 @@ class SymbolicVariable(VariableBase):
         )
         if (
             should_create_sym is None
+            and ENV_SOT_ENABLE_0_SIZE_FALLBACK.get()
             and SymbolicVariable.find_tensor_shape_source(tracker) is not None
         ):
             graph.add_global_guarded_variable(
@@ -1461,6 +1470,8 @@ class SymbolicVariable(VariableBase):
 
 
 class ParameterVariable(TensorVariable):
+    var_name_generator = NameGenerator("param_")
+
     def __init__(
         self,
         meta: MetaInfoOrNull,
@@ -1471,9 +1482,12 @@ class ParameterVariable(TensorVariable):
 
     @VariableFactory.register_from_value(successor="TensorVariable")
     def from_value(value: Any, graph: FunctionGraph, tracker: Tracker):
-        if isinstance(value, (paddle.base.framework.EagerParamBase)):
-            value = MetaInfoOrNull.from_tensor(value)
-            return ParameterVariable(value, graph, tracker)
+        if isinstance(value, paddle.base.framework.EagerParamBase):
+            meta = MetaInfoOrNull.from_tensor(value)
+            param_var = ParameterVariable(meta, graph, tracker)
+            if parameters_persistent_mode_is_enabled():
+                graph.parameters_holder.set(param_var.get_symbol().name, value)
+            return param_var
         return None
 
 
@@ -2426,18 +2440,9 @@ class DataClassInstanceVariable(VariableBase):
             id_getter=lambda _: data_id or id(data_dict),
         )
 
-    @staticmethod
-    def _dataclass_from_dict(dataclass_type: type[Any], data: dict[str, Any]):
-        # NOTE(SigureMo): Create dataclass without __post_init__,
-        # because __post_init__ has been run in simulation
-        instance = dataclass_type.__new__(dataclass_type, **data)
-        for fd in dataclasses.fields(dataclass_type):
-            setattr(instance, fd.name, data[fd.name])
-        return instance
-
     def _reconstruct(self, codegen: PyCodeGen) -> None:
         codegen.gen_load_object(
-            DataClassInstanceVariable._dataclass_from_dict,
+            dataclass_from_dict,
             "___dataclass_from_dict",
         )
         self.getattr("__class__").reconstruct(codegen)
@@ -2461,7 +2466,26 @@ class DataClassInstanceVariable(VariableBase):
     def getattr(self, name: str, default=None):
         if name == "__class__":
             return self.class_var
-        return self.proxy.get(name)
+        if name == "__post_init__":
+            cls_var = self.getattr("__class__")
+            return VariableFactory.from_value(
+                cls_var.value.__post_init__,
+                self.graph,
+                GetAttrTracker(cls_var, "__post_init__"),
+            ).bind(self, "__post_init__")
+        if name == "__dataclass_fields__":
+            return VariableFactory.from_value(
+                {
+                    fd.name: fd
+                    for fd in dataclasses.fields(self.class_var.value)
+                },
+                graph=self.graph,
+                tracker=GetAttrTracker(self, "__dataclass_fields__"),
+            )
+        res = self.proxy.get(name)
+        if self.proxy.is_empty(res):
+            return super().getattr(name, default)
+        return res
 
     def setattr(self, key: str, value):
         self.proxy.set(key, value)
@@ -2474,14 +2498,14 @@ class DataClassInstanceVariable(VariableBase):
         return VariableFactory.from_value(
             proxy.original_data[key],
             self.graph,
-            tracker=GetAttrTracker(self, key, changed=proxy.has_changed),
+            tracker=GetAttrTracker(self, key, changed=proxy.check_changed(key)),
         )
 
     def get_py_type(self):
         return self.class_var.get_py_value()
 
     def get_py_value(self, allow_tensor=False):
-        return DataClassInstanceVariable._dataclass_from_dict(
+        return dataclass_from_dict(
             self.get_py_type(),
             {
                 key: value.get_py_value(allow_tensor)
@@ -2563,18 +2587,18 @@ class DataClassInstanceVariable(VariableBase):
             for fd in dataclasses.fields(self.get_py_type())
         ]
 
-    @classmethod
-    def _custom_asdict(cls, obj):
-        return {f.name: getattr(obj, f.name) for f in dataclasses.fields(obj)}
-
     @VariableFactory.register_from_value()
     def from_value(value: object, graph: FunctionGraph, tracker: Tracker):
-        if is_dataclass(value) and not isinstance(value, type):
+        if is_plain_dataclass_type(type(value)):
             class_var = VariableFactory.from_value(
                 type(value), graph, DanglingTracker()
             )
+            try:
+                data_dict = dataclass_as_dict(value)
+            except:
+                data_dict = {}
             var = DataClassInstanceVariable(
-                DataClassInstanceVariable._custom_asdict(value),
+                data_dict,
                 class_var,
                 id(value),
                 graph=graph,
